@@ -58,7 +58,7 @@ var _ = Describe("[CANARY] test service connectivity", func() {
 
 	JustBeforeEach(func() {
 		deploymentContainer = manifest.NewBusyBoxContainerBuilder().
-			Image("nginx:1.21.4").
+			Image(utils.GetTestImage(utils.NginxImage)).
 			Command(nil).
 			Port(v1.ContainerPort{
 				ContainerPort: 80,

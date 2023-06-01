@@ -32,7 +32,7 @@ function up-test-cluster() {
     elif [[ "$RUN_PERFORMANCE_TESTS" == true ]]; then
         echo "Copying perf test cluster config to $CLUSTER_CONFIG"
         cp $CLUSTER_TEMPLATE_PATH/perf-cluster.yml $CLUSTER_CONFIG
-        AMI_ID=`aws ssm get-parameter --name /aws/service/eks/optimized-ami/${EKS_CLUSTER_VERSION}/amazon-linux-2/recommended/image_id --region us-west-2 --query "Parameter.Value" --output text`
+        AMI_ID=`aws ssm get-parameter --name /aws/service/eks/optimized-ami/${EKS_CLUSTER_VERSION}/amazon-linux-2/recommended/image_id --region $REGION --query "Parameter.Value" --output text`
         echo "Obtained ami_id as $AMI_ID"
         sed -i'.bak' "s,AMI_ID_PLACEHOLDER,$AMI_ID," $CLUSTER_CONFIG
         grep -r -q $AMI_ID $CLUSTER_CONFIG
