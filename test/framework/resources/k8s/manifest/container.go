@@ -14,6 +14,7 @@
 package manifest
 
 import (
+	"github.com/aws/amazon-vpc-cni-k8s/test/framework"
 	"github.com/aws/amazon-vpc-cni-k8s/test/framework/utils"
 	v1 "k8s.io/api/core/v1"
 )
@@ -32,7 +33,7 @@ type Container struct {
 func NewBusyBoxContainerBuilder() *Container {
 	return &Container{
 		name:            "busybox",
-		image:           utils.GetTestImage(utils.BusyBoxImage),
+		image:           GetTestImage(utils.BusyBoxImage),
 		imagePullPolicy: v1.PullIfNotPresent,
 		command:         []string{"sleep", "3600"},
 		args:            []string{},
@@ -51,7 +52,7 @@ func NewCurlContainer() *Container {
 func NewTestHelperContainer() *Container {
 	return &Container{
 		name:            "test-helper",
-		image:           utils.GetTestImage(utils.TestAgentImage),
+		image:           GetTestImage(utils.TestAgentImage),
 		imagePullPolicy: v1.PullIfNotPresent,
 	}
 }
@@ -61,13 +62,18 @@ func NewNetCatAlpineContainer() *Container {
 		name: "net-cat",
 		// simple netcat OpenBSD version with alpine as the base image
 		// compatible with arm64 and amd64
-		image:           utils.GetTestImage(utils.NetCatImage),
+		image:           GetTestImage(utils.NetCatImage),
 		imagePullPolicy: v1.PullIfNotPresent,
 	}
 }
 
 func NewBaseContainer() *Container {
 	return &Container{}
+}
+
+func GetTestImage(image string) string {
+	f := framework.New(framework.GlobalOptions)
+	return f.Options.TestImageRegistry + "/" + image
 }
 
 func (w *Container) CapabilitiesForSecurityContext(add []v1.Capability, drop []v1.Capability) *Container {
