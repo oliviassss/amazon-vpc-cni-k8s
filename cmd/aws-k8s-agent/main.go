@@ -16,6 +16,7 @@ package main
 
 import (
 	"os"
+	"time"
 
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/k8sapi"
@@ -36,6 +37,9 @@ const (
 
 	// Environment variable to disable the IPAMD introspection endpoint on 61679
 	envDisableIntrospection = "DISABLE_INTROSPECTION"
+
+	pollInterval = 5 * time.Second
+	pollTimeout  = 30 * time.Second
 )
 
 func main() {
@@ -49,28 +53,45 @@ func _main() int {
 	log.Infof("Starting L-IPAMD %s  ...", version.Version)
 	version.RegisterMetric()
 
+	enabledPodEni := ipamd.EnablePodENI()
+	enabledCustomNetwork := ipamd.UseCustomNetworkCfg()
+	withApiSever := false
 	// Check API Server Connectivity
-	if err := k8sapi.CheckAPIServerConnectivity(); err != nil {
-		log.Errorf("Failed to check API server connectivity: %s", err)
-		return 1
+	if enabledPodEni || enabledCustomNetwork {
+		if err := k8sapi.CheckAPIServerConnectivity(); err != nil {
+			log.Errorf("Failed to check API server connectivity: %s", err)
+			return 1
+		} else {
+			log.Info("API server connectivity established.")
+			withApiSever = true
+		}
+	} else {
+		log.Info("Waiting up to 30s for API server connectivity...")
+		if err := k8sapi.CheckAPIServerConnectivityWithTimeout(pollInterval, pollTimeout); err != nil {
+			log.Warn("Proceeding without API server connectivity")
+			withApiSever = false
+		} else {
+			log.Info("API server connectivity established.")
+			withApiSever = true
+		}
 	}
-
+	log.Info("------------------ here")
 	// Create Kubernetes client for API server requests
 	k8sClient, err := k8sapi.CreateKubeClient(appName)
 	if err != nil {
 		log.Errorf("Failed to create kube client: %s", err)
-		return 1
 	}
-
+	log.Info("------------------ here1")
 	// Create EventRecorder for use by IPAMD
-	if err := eventrecorder.Init(k8sClient); err != nil {
+	if err := eventrecorder.Init(k8sClient, withApiSever); err != nil {
 		log.Errorf("Failed to create event recorder: %s", err)
-		return 1
+		log.Warn("Skipping event recorder initialization")
+		//return 1
 	}
-
-	ipamContext, err := ipamd.New(k8sClient)
+	log.Info("------------------ here2")
+	ipamContext, err := ipamd.New(k8sClient, withApiSever)
 	if err != nil {
-		log.Errorf("Initialization failure: %v", err)
+		log.Errorf("---------------------------- Initialization failure: %v", err)
 		return 1
 	}
 

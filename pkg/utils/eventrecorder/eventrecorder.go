@@ -49,26 +49,36 @@ type EventRecorder struct {
 	hostPod   corev1.Pod
 }
 
-func Init(k8sClient client.Client) error {
+func Init(k8sClient client.Client, withApiSever bool) error {
+	log.Info("------------ Entering eventrecorder.Init()")
 	clientSet, err := k8sapi.GetKubeClientSet()
 	if err != nil {
-		log.Fatalf("Error Fetching Kubernetes Client: %s", err)
+		log.Errorf("Error Fetching Kubernetes Client: %s", err)
 		return err
 	}
+	log.Info("------------ Successfully created KubeClientSet in eventrecorder.Init()")
 	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{
 		Interface: clientSet.EventsV1(),
 	})
 	stopCh := make(chan struct{})
 	eventBroadcaster.StartRecordingToSink(stopCh)
 
+	log.Info("------------ Successfully started event broadcaster")
+
 	eventRecorder = &EventRecorder{}
 	eventRecorder.Recorder = eventBroadcaster.NewRecorder(clientgoscheme.Scheme, "aws-node")
 	eventRecorder.K8sClient = k8sClient
-
-	if eventRecorder.hostPod, err = findMyPod(eventRecorder.K8sClient); err != nil {
-		log.Errorf("Failed to find host aws-node pod: %s", err)
-		// EventRecorder is not considered critical, so no error is returned if host pod cannot be queried
+	log.Info("------------ Successfully created event recorder")
+	if withApiSever {
+		if eventRecorder.hostPod, err = findMyPod(eventRecorder.K8sClient); err != nil {
+			log.Errorf("Failed to find host aws-node pod: %s", err)
+			// EventRecorder is not considered critical, so no error is returned if host pod cannot be queried
+		}
+	} else {
+		log.Warn("Skipping set hostPod for eventRecorder due tp apiserver connectivity issue")
 	}
+
+	log.Info("------------ Exiting eventrecorder.Init() successfully")
 	return nil
 }
 

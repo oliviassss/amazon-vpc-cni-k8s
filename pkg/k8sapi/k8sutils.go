@@ -3,18 +3,19 @@ package k8sapi
 import (
 	"context"
 	"fmt"
+	eniconfigscheme "github.com/aws/amazon-vpc-cni-k8s/pkg/apis/crd/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/klog/v2"
 	"os"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
-
-	eniconfigscheme "github.com/aws/amazon-vpc-cni-k8s/pkg/apis/crd/v1alpha1"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/utils/logger"
 	"github.com/aws/amazon-vpc-cni-k8s/utils"
 	rcscheme "github.com/aws/amazon-vpc-resource-controller-k8s/apis/vpcresources/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -26,7 +27,9 @@ import (
 )
 
 const (
-	awsNode = "aws-node"
+	awsNode                 = "aws-node"
+	waitGetNodePollPeriod   = 30 * time.Second
+	waitGetNodePollInterval = 5 * time.Second
 )
 
 var log = logger.Get()
@@ -113,21 +116,24 @@ func CreateKubeClient(appName string) (client.Client, error) {
 	}
 	cacheReader, err := CreateKubeClientCache(restCfg, vpcCniScheme, filterMap)
 	if err != nil {
-		return nil, err
+		log.Warnf("Skipping cache-based Kubernetes client due to API connectivity issues: %s", err)
+		cacheReader = nil
 	}
-	// Start cache and wait for initial sync
-	StartKubeClientCache(cacheReader)
 
-	// The cache will start a WATCH for all GVKs in the scheme.
-	k8sClient, err := client.New(restCfg, client.Options{
-		Cache: &client.CacheOptions{
-			Reader: cacheReader,
-		},
-		Scheme: vpcCniScheme,
-	})
+	clientOpts := client.Options{Scheme: vpcCniScheme}
+	if cacheReader != nil {
+		log.Info("Cache-based Kubernetes client successfully created.")
+		go StartKubeClientCache(cacheReader)
+		clientOpts.Cache = &client.CacheOptions{Reader: cacheReader}
+	} else {
+		log.Warn("Running Kubernetes client in direct mode (no cache)")
+	}
+
+	k8sClient, err := client.New(restCfg, clientOpts)
 	if err != nil {
 		return nil, err
 	}
+	log.Info("-------------------------- k8sClient created successfully")
 	return k8sClient, nil
 }
 
@@ -175,6 +181,31 @@ func CheckAPIServerConnectivity() error {
 	})
 }
 
+func CheckAPIServerConnectivityWithTimeout(pollInterval time.Duration, pollTimeout time.Duration) error {
+	restCfg, err := getRestConfig()
+	if err != nil {
+		return err
+	}
+	restCfg.Timeout = 5 * time.Second
+	clientSet, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		return fmt.Errorf("creating kube config, %w", err)
+	}
+
+	log.Info("Testing communication with server ...")
+
+	return wait.PollImmediate(pollInterval, pollTimeout, func() (bool, error) {
+		version, err := clientSet.Discovery().ServerVersion()
+		if err != nil {
+			log.Errorf("Unable to reach API Server: %v", err)
+			return false, nil // Retry
+		}
+
+		log.Infof("Successful communication with the Cluster! Cluster Version is: %s", version.GitVersion)
+		return true, nil
+	})
+}
+
 func getRestConfig() (*rest.Config, error) {
 	restCfg, err := ctrl.GetConfig()
 	if err != nil {
@@ -188,12 +219,28 @@ func getRestConfig() (*rest.Config, error) {
 }
 
 func GetNode(ctx context.Context, k8sClient client.Client) (corev1.Node, error) {
-	log.Infof("Get Node Info for: %s", os.Getenv("MY_NODE_NAME"))
-	var node corev1.Node
-	err := k8sClient.Get(ctx, types.NamespacedName{Name: os.Getenv("MY_NODE_NAME")}, &node)
+	nodeName := os.Getenv("MY_NODE_NAME")
+	log.Infof("Get Node Info for: %s", nodeName)
+
+	node := corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName},
+	}
+
+	// If API server is unavailable, return immediately
+	if k8sClient == nil {
+		log.Warnf(" -------------------- Skipping GetNode() as Kubernetes API client is unavailable.")
+		return node, fmt.Errorf("Kubernetes API client is not available")
+	}
+
+	// Create a context with timeout to avoid hanging indefinitely
+	apiCtx, cancel := context.WithTimeout(ctx, 3*time.Second) // Set 3-second timeout
+	defer cancel()
+
+	err := k8sClient.Get(apiCtx, types.NamespacedName{Name: nodeName}, &node)
 	if err != nil {
-		log.Errorf("error retrieving node: %s", err)
+		klog.Errorf("Failed to get node %s: %v", nodeName, err)
 		return node, err
 	}
+
 	return node, nil
 }

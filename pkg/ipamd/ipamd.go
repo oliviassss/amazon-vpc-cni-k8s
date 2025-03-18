@@ -15,7 +15,9 @@ package ipamd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/aws/amazon-vpc-cni-k8s/pkg/k8sapi"
 	"net"
 	"os"
 	"strconv"
@@ -42,7 +44,6 @@ import (
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/awsutils"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/eniconfig"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/ipamd/datastore"
-	"github.com/aws/amazon-vpc-cni-k8s/pkg/k8sapi"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/networkutils"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/utils/cniutils"
 	"github.com/aws/amazon-vpc-cni-k8s/pkg/utils/logger"
@@ -185,6 +186,9 @@ const (
 	// envEnableNetworkPolicy is used to enable IPAMD/CNI to send pod create events to network policy agent.
 	envNetworkPolicyMode     = "NETWORK_POLICY_ENFORCING_MODE"
 	defaultNetworkPolicyMode = "standard"
+
+	defaultMaxPodsFromKubelet = 110
+	kubeletConfigPath         = "/host/etc/kubernetes/kubelet/kubelet-config.json"
 )
 
 var log = logger.Get()
@@ -230,6 +234,11 @@ type IPAMContext struct {
 	enablePodIPAnnotation     bool
 	maxPods                   int // maximum number of pods that can be scheduled on the node
 	networkPolicyMode         string
+	withApiServer             bool
+}
+
+type kubeletConfig struct {
+	MaxPods *int64 `json:"maxPods"`
 }
 
 // setUnmanagedENIs will rebuild the set of ENI IDs for ENIs tagged as "no_manage"
@@ -335,7 +344,7 @@ func (c *IPAMContext) inInsufficientCidrCoolingPeriod() bool {
 
 // New retrieves IP address usage information from Instance MetaData service and Kubelet
 // then initializes IP address pool data store
-func New(k8sClient client.Client) (*IPAMContext, error) {
+func New(k8sClient client.Client, withApiServer bool) (*IPAMContext, error) {
 	prometheusRegister()
 	c := &IPAMContext{}
 	c.k8sClient = k8sClient
@@ -360,7 +369,7 @@ func New(k8sClient client.Client) (*IPAMContext, error) {
 	c.warmIPTarget = getWarmIPTarget()
 	c.minimumIPTarget = getMinimumIPTarget()
 	c.warmPrefixTarget = getWarmPrefixTarget()
-	c.enablePodENI = enablePodENI()
+	c.enablePodENI = EnablePodENI()
 	c.enableManageUntaggedMode = enableManageUntaggedMode()
 	c.enablePodIPAnnotation = enablePodIPAnnotation()
 	c.numNetworkCards = len(c.awsClient.GetNetworkCards())
@@ -385,7 +394,8 @@ func New(k8sClient client.Client) (*IPAMContext, error) {
 	c.myNodeName = os.Getenv(envNodeName)
 	checkpointer := datastore.NewJSONFile(dsBackingStorePath())
 	c.dataStore = datastore.NewDataStore(log, checkpointer, c.enablePrefixDelegation)
-
+	c.withApiServer = withApiServer
+	log.Info("------------------ here3")
 	if err := c.nodeInit(); err != nil {
 		return nil, err
 	}
@@ -523,21 +533,30 @@ func (c *IPAMContext) nodeInit() error {
 		}, 30*time.Second)
 	}
 
-	// Make a k8s client request for the current node so that max pods can be derived
-	node, err := k8sapi.GetNode(ctx, c.k8sClient)
-	if err != nil {
-		log.Errorf("Failed to get node", err)
-		podENIErrInc("nodeInit")
-		return err
+	// if apiserver is connected, get the maxPods from node
+	var node corev1.Node
+	if c.withApiServer {
+		node, err := k8sapi.GetNode(ctx, c.k8sClient)
+		if err != nil {
+			log.Errorf("------------------------------ Failed to get node, %s", err)
+			podENIErrInc("nodeInit")
+			return err
+		} else {
+			maxPods, isInt64 := node.Status.Capacity.Pods().AsInt64()
+			if !isInt64 {
+				log.Errorf("Failed to parse max pods: %s", node.Status.Capacity.Pods().String)
+				podENIErrInc("nodeInit")
+				return errors.New("error while trying to determine max pods")
+			}
+			c.maxPods = int(maxPods)
+		}
+	} else {
+		maxPods, err := getMaxPodsFromKubelet()
+		if err != nil {
+			log.Errorf("------------------------------- Failed to parse max pods from kubelet config: %s", err)
+		}
+		c.maxPods = int(maxPods)
 	}
-
-	maxPods, isInt64 := node.Status.Capacity.Pods().AsInt64()
-	if !isInt64 {
-		log.Errorf("Failed to parse max pods: %s", node.Status.Capacity.Pods().String)
-		podENIErrInc("nodeInit")
-		return errors.New("error while trying to determine max pods")
-	}
-	c.maxPods = int(maxPods)
 
 	if c.useCustomNetworking {
 		// When custom networking is enabled and a valid ENIConfig is found, IPAMD patches the CNINode
@@ -1691,6 +1710,24 @@ func (c *IPAMContext) warmIPTargetsDefined() bool {
 	return c.warmIPTarget != noWarmIPTarget || c.minimumIPTarget != noMinimumIPTarget
 }
 
+func getMaxPodsFromKubelet() (int64, error) {
+	data, err := os.ReadFile(kubeletConfigPath)
+	if err != nil {
+		return defaultMaxPodsFromKubelet, fmt.Errorf("failed to read kubelet config: %w", err)
+	}
+
+	var config kubeletConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return defaultMaxPodsFromKubelet, fmt.Errorf("failed to parse kubelet config JSON: %w", err)
+	}
+
+	if config.MaxPods != nil {
+		return *config.MaxPods, nil
+	}
+
+	return defaultMaxPodsFromKubelet, nil
+}
+
 // UseCustomNetworkCfg returns whether Pods needs to use pod specific configuration or not.
 func UseCustomNetworkCfg() bool {
 	return parseBoolEnvVar(envCustomNetworkCfg, false)
@@ -1766,7 +1803,7 @@ func disableLeakedENICleanup() bool {
 	return isIPv6Enabled() || disableENIProvisioning() || utils.GetBoolAsStringEnvVar(envDisableLeakedENICleanup, false)
 }
 
-func enablePodENI() bool {
+func EnablePodENI() bool {
 	return utils.GetBoolAsStringEnvVar(envEnablePodENI, false)
 }
 
